@@ -1,0 +1,1138 @@
+// script.js
+document.addEventListener('DOMContentLoaded', ()=>{
+
+  // Simple API helper - UPDATED: Added robust error handling
+  function api(action, opts={}){
+    opts = opts || {};
+    const method = (opts.method||'GET').toUpperCase();
+    const params = Object.assign({}, opts.params || {});
+    params.action = action;
+
+    const doFetch = (url, fetchOpts) => {
+        return fetch(url, fetchOpts)
+            .then(r => {
+                if (!r.ok) {
+                    // Try to parse error message if available, otherwise return generic error
+                    return r.text().then(text => {
+                        try {
+                            const errorJson = JSON.parse(text);
+                            return errorJson; // If PHP returned {ok:false, error:...}
+                        } catch (e) {
+                            // Non-JSON response (e.g. PHP error/500), return generic fail
+                            console.error(`Non-JSON API error from ${action}: ${text}`);
+                            return { ok: false, error: `Server returned status ${r.status}` };
+                        }
+                    });
+                }
+                return r.json().catch(e => {
+                    // Catch JSON parsing failure even if status is 200 (e.g. empty response)
+                    console.error("JSON parse error:", e);
+                    return { ok: false, error: 'Invalid JSON response from server' };
+                });
+            })
+            .catch(e => {
+                // Catch network failure (e.g. server down)
+                console.error("API network call failed:", e);
+                return { ok: false, error: 'Network connection error' };
+            });
+    };
+    
+    if(method === 'GET'){
+      const url = 'api.php?' + new URLSearchParams(params).toString();
+      return doFetch(url);
+    } else {
+      if(opts.body instanceof FormData){
+        return doFetch('api.php?action='+action, { method:'POST', body: opts.body });
+      } else {
+        const body = opts.body && typeof opts.body === 'object' ? JSON.stringify(opts.body) : (opts.body||'');
+        return doFetch('api.php?action='+action, { method:'POST', headers:{'Content-Type':'application/json'}, body: body });
+      }
+    }
+  }
+
+  // Helpers
+  function escapeHtml(s){ if(s===undefined||s===null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function debounce(fn, ms=250){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+
+  const formatCurrency = (num) => Number(num || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  // Panels
+  const panels = {
+    dashboard: document.getElementById('panel-dashboard'),
+    inventory: document.getElementById('panel-inventory'),
+    branches: document.getElementById('panel-branches'),
+    suppliers: document.getElementById('panel-suppliers'),
+    accounts: document.getElementById('panel-accounts'),
+    logs: document.getElementById('panel-logs'),
+    pos: document.getElementById('panel-pos')
+  };
+  function showPanel(name){
+    Object.values(panels).forEach(p=>p && p.classList.add('d-none'));
+    if(panels[name]) panels[name].classList.remove('d-none');
+
+    const menuItems = document.querySelectorAll('.sidebar .list-group-item');
+    menuItems.forEach(item => {
+        if (item.id === `menu-${name}`) {
+            item.classList.add('active');
+        } else {
+            item.classList.remove('active');
+        }
+    });
+  }
+  ['dashboard','inventory','branches','suppliers','accounts','logs','pos'].forEach(id=>{
+    const el = document.getElementById('menu-'+id);
+    if(!el) return;
+    el.addEventListener('click', ()=> showPanel(id));
+    // ADDED: Default load action logs when logs panel is opened
+    if (id === 'logs') el.addEventListener('click', loadActionLogs);
+    if (id === 'suppliers') el.addEventListener('click', loadSuppliers);
+  });
+
+  // CART
+  window.CART = window.CART || [];
+  function addToCart(id, size, qty = 1) {
+    qty = parseInt(qty || 1, 10);
+    const ex = CART.find(x => x.id == id && x.size == size);
+    if (ex) {
+        ex.qty += qty;
+    } else {
+        CART.push({ id: parseInt(id, 10), size, qty });
+    }
+    updateCartUI();
+  }
+  function updateCart(id, size, newQty) {
+    const item = CART.find(x => x.id == id && x.size == size);
+    if (item) {
+        if (newQty > 0) {
+            item.qty = newQty;
+        } else {
+            CART = CART.filter(x => !(x.id == id && x.size == size));
+        }
+    }
+    updateCartUI();
+    renderCart();
+  }
+  function updateCartUI(){ const count = CART.reduce((s,i)=>s+i.qty,0); const el = document.getElementById('cartCount'); if(el) el.textContent = count; }
+
+  // Branch selects (populate and enforce staff behavior)
+  function populateBranchSelects(){
+    return api('get_branches').then(res=>{
+      if(!res.ok) return;
+      const selects = document.querySelectorAll('#posBranchSelect,#filterBranch,#addItemBranchSelect,#editItemBranchSelect,#userBranchSelect,#editUserBranchSelect');
+      selects.forEach(s=>{
+        if(!s) return;
+        s.innerHTML = '<option value="">All Branches</option>' + res.branches.map(b=>`<option value="${b.id}">${escapeHtml(b.name)}</option>`).join('');
+      });
+      // If ASSIGNED_BRANCH is set (server-side), set posBranchSelect and lock for staff
+      const posSel = document.getElementById('posBranchSelect');
+      if(posSel && typeof ASSIGNED_BRANCH !== 'undefined' && ASSIGNED_BRANCH){
+        posSel.value = ASSIGNED_BRANCH;
+      }
+      // If staff role, disable branch selector to prevent switching branch on UI (server also enforces)
+      if(typeof USER_ROLE !== 'undefined' && USER_ROLE === 'staff'){
+        const p = document.getElementById('posBranchSelect');
+        if(p) p.disabled = true;
+      }
+    });
+  }
+
+  // POS products
+  function loadPOSProducts(){
+    const container = document.getElementById('posProducts');
+    if(!container) return;
+    const q = document.getElementById('posSearch') ? document.getElementById('posSearch').value : '';
+    const category = document.querySelector('#posCategoryFilter .btn.active')?.dataset.category || '';
+    const branch = document.getElementById('posBranchSelect') ? document.getElementById('posBranchSelect').value : '';
+    api('get_products',{ params:{ q: q, category: category, branch_id: branch, source: 'pos' } }).then(res=>{
+      if(!res.ok){ container.innerHTML = `<div class="text-danger">Failed to load products: ${escapeHtml(res.error)}</div>`; console.error(res.error); return; }
+      const arr = res.products || [];
+      if(arr.length===0){ container.innerHTML = '<div class="text-muted">No products found</div>'; return; }
+
+      const getStock = (stocks, size) => {
+        const stock = stocks.find(s => s.size.toLowerCase() === size.toLowerCase());
+        return stock ? stock.quantity : 0;
+      };
+
+     container.innerHTML = arr.map(p=>`
+        <div class="col-xl-2 col-lg-3 col-md-4 col-sm-6">
+          <div class="card h-100">
+            <img src="${escapeHtml(p.photo || 'uploads/no-image.png')}" class="card-img-top" style="height:100px;object-fit:cover" alt="${escapeHtml(p.name)}">
+            <div class="card-body p-1">
+              <div class="fw-semibold" style="font-size:0.9em;">${escapeHtml(p.name)}</div>
+              <div class="small text-muted" style="font-size:0.8em;">${escapeHtml(p.category||'')}</div>
+              <div class="fw-semibold mt-1">₱${formatCurrency(p.price||0)}</div>
+              <div class="mt-2 stock-container" data-product-id="${p.id}" data-stock-display-type="${p.stock_display_type || 'regular'}">
+                <div class="size-boxes d-none">
+                  <div class="size-box" data-size="s">S<br><small>${getStock(p.stocks, 's')} left</small></div>
+                  <div class="size-box" data-size="m">M<br><small>${getStock(p.stocks, 'm')} left</small></div>
+                  <div class="size-box" data-size="l">L<br><small>${getStock(p.stocks, 'l')} left</small></div>
+                  <div class="size-box" data-size="xl">XL<br><small>${getStock(p.stocks, 'xl')} left</small></div>
+                </div>
+                <div class="input-group input-group-sm mt-2">
+                  <div class="regular-stock-display d-none input-group-text bg-light border-end-0">
+                    <small>Stock: ${getStock(p.stocks, 'os')}</small>
+                  </div>
+                  <input type="number" min="1" value="1" class="form-control qty-input">
+                  <button class="btn btn-primary btn-sm add-to-cart-btn">Add</button> 
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `).join('');
+
+      container.querySelectorAll('.stock-container').forEach(sc => {
+        const stockDisplayType = sc.dataset.stockDisplayType;
+        if (stockDisplayType === 'regular') {
+            sc.querySelector('.size-boxes')?.classList.add('d-none');
+            sc.querySelector('.regular-stock-display')?.classList.remove('d-none'); // Show stock count
+        } else if (stockDisplayType === 'sizes') { // Ensure size boxes are visible and regular stock is hidden for size-based products
+            sc.querySelector('.size-boxes')?.classList.remove('d-none');
+            sc.querySelector('.regular-stock-display')?.classList.add('d-none');
+        }
+      });
+
+      container.querySelectorAll('.size-box').forEach(box => {
+        box.addEventListener('click', () => {
+         const productId = box.closest('.stock-container').dataset.productId;
+          // Deselect other boxes for the same product
+          container.querySelectorAll(`.stock-container[data-product-id="${productId}"] .size-box`).forEach(b => b.classList.remove('selected'));
+          // Select the clicked box
+          box.classList.add('selected');
+        });
+      });
+
+      container.querySelectorAll('.add-to-cart-btn').forEach(b => b.addEventListener('click', () => {
+        const stockContainer = b.closest('.stock-container');
+        const id = stockContainer.dataset.productId;
+        const stockDisplayType = stockContainer.dataset.stockDisplayType; // Use the new attribute
+        const qty = parseInt(stockContainer.querySelector('.qty-input').value || '1', 10); 
+
+        if (stockDisplayType === 'regular') {
+            addToCart(id, 'os', qty);
+        } else {
+            const selectedSizeBox = stockContainer.querySelector('.size-box.selected');
+            if (!selectedSizeBox) {
+              alert('Please select a size.'); return;
+            }
+            addToCart(id, selectedSizeBox.dataset.size, qty);
+        }
+      })); // End of .add-to-cart-btn listener attachment
+    }); // End of api().then()
+  }
+
+  document.getElementById('posSearch')?.addEventListener('input', debounce(loadPOSProducts, 300));
+  document.getElementById('posBranchSelect')?.addEventListener('change', loadPOSProducts);
+  document.querySelectorAll('#posCategoryFilter .btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      // Set active state
+      document.querySelectorAll('#posCategoryFilter .btn').forEach(b => b.classList.remove('btn-secondary', 'active'));
+      document.querySelectorAll('#posCategoryFilter .btn').forEach(b => b.classList.add('btn-outline-secondary'));
+      btn.classList.remove('btn-outline-secondary');
+      btn.classList.add('btn-secondary', 'active');
+      loadPOSProducts();
+    });
+  });
+
+  // Inventory list (view-only for staff)
+  function loadInventory(){
+    const tbl = document.getElementById('inventoryContent'); if(!tbl) return;
+    const q = document.getElementById('inventorySearch') ? document.getElementById('inventorySearch').value : '';
+    const branch = document.getElementById('filterBranch') ? document.getElementById('filterBranch').value : '';
+    api('get_products',{ params:{ q:q, branch_id: branch, source: 'inventory' } }).then(res=>{
+      if(!res.ok) { console.error(res.error); return; }
+      console.log(res.products);
+      const rows = res.products.map(p=>`<tr>
+        <td>${p.id}</td>
+        <td>${escapeHtml(p.name)}</td>
+        <td>${escapeHtml(p.category || '')}</td>
+        <td>₱${formatCurrency(p.price||0)}</td>
+        <td>
+          ${(p.stocks && p.stocks.length > 0) 
+            ? p.stocks.map(s => `<div>${s.size === 'os' ? 'Stock' : s.size.toUpperCase()}: ${s.quantity}</div>`).join('') 
+            : 'N/A'}
+        </td>
+        <td>${escapeHtml(p.branch_name||'')}</td>
+        <td>${USER_ROLE==='owner'?`<button class="btn btn-sm btn-outline-primary edit-product" data-id="${p.id}">Edit</button> <button class="btn btn-sm btn-danger delete-product" data-id="${p.id}">Delete</button>`:'Read-only'}</td>
+      </tr>`).join('');
+      tbl.innerHTML = `<table class="table"><thead><tr><th>ID</th><th>Name</th><th>Category</th><th>Price</th><th>Stock</th><th>Branch</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>`;
+      document.querySelectorAll('.edit-product').forEach(btn=> btn.addEventListener('click', ()=>{
+        const id = btn.dataset.id;
+        const prod = res.products.find(x=>x.id==id);
+        if(!prod) return;
+        document.getElementById('editItemId').value = prod.id;
+        document.getElementById('editItemName').value = prod.name;
+        const categorySelect = document.getElementById('editItemCategory');
+        categorySelect.value = prod.category;
+
+        // Determine if the product uses regular stock ('os') or sized stock
+        const hasRegularStock = prod.stocks.some(s => s.size === 'os');
+        const stockType = hasRegularStock ? 'regular' : 'sizes';
+
+        // Manually trigger change to update stock fields visibility
+        handleCategoryChange(
+            prod.category,
+            document.getElementById('editItemSizeStock'),
+            document.getElementById('editItemRegularStock'),
+            document.getElementById('editItemOthersStockTypeContainer')
+        );
+
+        // Also trigger the 'others' stock type handler if needed
+        handleOthersStockTypeChange(stockType, document.getElementById('editItemSizeStock'), document.getElementById('editItemRegularStock'));
+        document.getElementById('editItemPrice').value = prod.price;
+
+        // Reset all stock fields
+        document.getElementById('editItemStockS').value = 0;
+        document.getElementById('editItemStockM').value = 0;
+        document.getElementById('editItemStockL').value = 0;
+        document.getElementById('editItemStockXL').value = 0;
+        document.getElementById('editItemStockRegular').value = 0;
+
+        if(prod.stocks){
+            prod.stocks.forEach(s => {
+                let input;
+                if (s.size === 'os') {
+                    input = document.getElementById('editItemStockRegular');
+                } else {
+                    input = document.getElementById(`editItemStock${s.size.toUpperCase()}`);
+                }
+                if(input) input.value = s.quantity;
+            });
+        }
+        setTimeout(()=>{ const sel=document.getElementById('editItemBranchSelect'); if(sel) sel.value = prod.branch_id||''; },120);
+        document.getElementById('editItemCurrentImg').src = prod.photo || 'uploads/no-image.png'; document.getElementById('editItemCurrentImg').style.display='block';
+        new bootstrap.Modal(document.getElementById('editItemModal')).show();
+      }));
+      document.querySelectorAll('.delete-product').forEach(btn=> btn.addEventListener('click', ()=>{
+        if(!confirm('Delete product?')) return;
+        const fd = new FormData(); fd.append('id', btn.dataset.id);
+        fetch('api.php?action=delete_product',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok){ loadInventory(); loadPOSProducts(); } else alert(res.error||'Error'); });
+      }));
+    });
+  }
+  document.getElementById('inventorySearch')?.addEventListener('input', debounce(loadInventory, 300));
+  document.getElementById('filterBranch')?.addEventListener('change', loadInventory);
+
+  // Add product form
+  const addItemForm = document.getElementById('addItemForm');
+  if(addItemForm) addItemForm.addEventListener('submit', e=>{
+    e.preventDefault();
+    const fd = new FormData(addItemForm);
+    fetch('api.php?action=add_product',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok){ bootstrap.Modal.getInstance(document.getElementById('addItemModal'))?.hide(); loadInventory(); loadPOSProducts(); } else alert(res.error||'Error'); });
+  });
+
+  // Add/Edit Modal Category Change Handler
+  function handleCategoryChange(categoryValue, sizeStockEl, regularStockEl, othersContainerEl) {
+      if (categoryValue === 'bracket' || categoryValue === 'topbox') {
+          sizeStockEl.classList.add('d-none');
+          regularStockEl.classList.remove('d-none');
+          if (othersContainerEl) othersContainerEl.classList.add('d-none');
+      } else if (categoryValue === 'others') {
+          sizeStockEl.classList.add('d-none');
+          regularStockEl.classList.add('d-none');
+          if (othersContainerEl) othersContainerEl.classList.remove('d-none');
+      } else {
+          sizeStockEl.classList.remove('d-none');
+          regularStockEl.classList.add('d-none');
+          if (othersContainerEl) othersContainerEl.classList.add('d-none');
+      }
+  }
+
+  const addItemCategorySelect = document.querySelector('#addItemModal select[name="category"]');
+  if (addItemCategorySelect) {
+      addItemCategorySelect.addEventListener('change', (e) => {
+          handleCategoryChange(e.target.value, document.getElementById('addItemSizeStock'), document.getElementById('addItemRegularStock'), document.getElementById('addItemOthersStockTypeContainer'));
+      });
+  }
+  const editItemCategorySelect = document.querySelector('#editItemModal select[name="category"]');
+  if (editItemCategorySelect) {
+      editItemCategorySelect.addEventListener('change', (e) => {
+          handleCategoryChange(e.target.value, document.getElementById('editItemSizeStock'), document.getElementById('editItemRegularStock'), document.getElementById('editItemOthersStockTypeContainer'));
+      });
+  }
+
+  // Handler for the new "others" stock type dropdown
+  function handleOthersStockTypeChange(typeValue, sizeStockEl, regularStockEl) {
+      if (typeValue === 'sizes') {
+          sizeStockEl.classList.remove('d-none');
+          regularStockEl.classList.add('d-none');
+      } else if (typeValue === 'regular') {
+          sizeStockEl.classList.add('d-none');
+          regularStockEl.classList.remove('d-none');
+      } else {
+          sizeStockEl.classList.add('d-none');
+          regularStockEl.classList.add('d-none');
+      }
+  }
+
+  document.querySelector('#addItemModal select[name="others_stock_type"]')?.addEventListener('change', (e) => {
+      handleOthersStockTypeChange(e.target.value, document.getElementById('addItemSizeStock'), document.getElementById('addItemRegularStock'));
+  });
+  document.querySelector('#editItemModal select[name="others_stock_type"]')?.addEventListener('change', (e) => {
+      handleOthersStockTypeChange(e.target.value, document.getElementById('editItemSizeStock'), document.getElementById('editItemRegularStock'));
+  });
+
+  // Edit product form
+  const editItemForm = document.getElementById('editItemForm');
+  if(editItemForm) editItemForm.addEventListener('submit', e=>{
+    e.preventDefault();
+    const fd = new FormData(editItemForm);
+    fetch('api.php?action=edit_product',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok){ bootstrap.Modal.getInstance(document.getElementById('editItemModal'))?.hide(); loadInventory(); loadPOSProducts(); } else alert(res.error||'Error'); });
+  });
+
+  // Branches
+  function loadBranches(){
+    api('get_branches').then(res=>{
+      if(!res.ok) return;
+      const list = document.getElementById('branchesManage');
+      if(!list) return;
+      list.innerHTML = res.branches.map(b=>`<div class="list-group-item d-flex justify-content-between align-items-center p-2 mb-2 border rounded"><strong>${escapeHtml(b.name)}</strong><div>${USER_ROLE==='owner'?`<button class='btn btn-sm btn-primary edit-branch' data-id='${b.id}' data-name='${escapeHtml(b.name)}'>Edit</button> <button class='btn btn-sm btn-danger delete-branch' data-id='${b.id}'>Delete</button>`:''}</div></div>`).join('');
+      document.querySelectorAll('.edit-branch').forEach(btn=> btn.addEventListener('click', ()=>{ document.getElementById('editBranchId').value=btn.dataset.id; document.getElementById('editBranchName').value=btn.dataset.name; new bootstrap.Modal(document.getElementById('editBranchModal')).show(); }));
+      document.querySelectorAll('.delete-branch').forEach(btn=> btn.addEventListener('click', ()=>{ if(!confirm('Delete branch?')) return; const fd=new FormData(); fd.append('id',btn.dataset.id); fetch('api.php?action=delete_branch',{ method:'POST', body:fd }).then(r=>r.json()).then(res=>{ if(res.ok){ loadBranches(); populateBranchSelects(); loadInventory(); } else alert(res.error||'Error'); }); }));
+    });
+  }
+
+  // Add branch
+  const addBranchForm = document.getElementById('addBranchForm');
+  if(addBranchForm) addBranchForm.addEventListener('submit', e=>{ e.preventDefault(); const fd = new FormData(addBranchForm); fetch('api.php?action=add_branch',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok){ bootstrap.Modal.getInstance(document.getElementById('addBranchModal'))?.hide(); loadBranches(); populateBranchSelects(); } else alert(res.error||'Error'); }); });
+
+  // Edit branch
+  const editBranchForm = document.getElementById('editBranchForm');
+  if(editBranchForm) editBranchForm.addEventListener('submit', e=>{ e.preventDefault(); const fd=new FormData(editBranchForm); fetch('api.php?action=edit_branch',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok){ bootstrap.Modal.getInstance(document.getElementById('editBranchModal'))?.hide(); loadBranches(); populateBranchSelects(); } else alert(res.error||'Error'); }); });
+
+  // Suppliers
+  function loadSuppliers(){
+    const tbl = document.getElementById('suppliersContent'); if(!tbl) return;
+    api('get_suppliers').then(res=>{
+      if(!res.ok) { console.error(res.error); return; }
+      const rows = res.suppliers.map(s=>`<tr>
+        <td>${s.id}</td>
+        <td>${escapeHtml(s.name)}</td>
+        <td>${escapeHtml(s.email||'')}</td>
+        <td>${escapeHtml(s.phone||'')}</td>
+        <td>${escapeHtml(s.location||'')}</td>
+        <td>${escapeHtml(s.brands||'')}</td>
+        <td>${escapeHtml(s.products||'')}</td>
+        <td><button class="btn btn-sm btn-primary edit-supplier" data-id="${s.id}">Edit</button> <button class="btn btn-sm btn-danger delete-supplier" data-id="${s.id}">Delete</button></td>
+      </tr>`).join('');
+      tbl.innerHTML = `<table class="table"><thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Phone</th><th>Location</th><th>Brands</th><th>Products</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>`;
+      
+      document.querySelectorAll('.edit-supplier').forEach(btn=> btn.addEventListener('click', ()=>{
+        const id = btn.dataset.id;
+        const supplier = res.suppliers.find(x=>x.id==id);
+        if(!supplier) return;
+
+        document.getElementById('editSupplierId').value = supplier.id;
+        document.getElementById('editSupplierName').value = supplier.name;
+        document.getElementById('editSupplierEmail').value = supplier.email;
+        document.getElementById('editSupplierPhone').value = supplier.phone;
+        document.getElementById('editSupplierLocation').value = supplier.location;
+        document.getElementById('editSupplierBrands').value = supplier.brands;
+        document.getElementById('editSupplierProducts').value = supplier.products;
+
+        new bootstrap.Modal(document.getElementById('editSupplierModal')).show();
+      }));
+
+      document.querySelectorAll('.delete-supplier').forEach(btn=> btn.addEventListener('click', ()=>{
+        if(!confirm('Delete supplier?')) return;
+        const fd = new FormData(); fd.append('id', btn.dataset.id);
+        fetch('api.php?action=delete_supplier',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok) loadSuppliers(); else alert(res.error||'Error'); });
+      }));
+    });
+  }
+
+  const addSupplierForm = document.getElementById('addSupplierForm');
+  if(addSupplierForm) addSupplierForm.addEventListener('submit', e=>{
+    e.preventDefault();
+    const fd = new FormData(addSupplierForm);
+    fetch('api.php?action=add_supplier',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok){ bootstrap.Modal.getInstance(document.getElementById('addSupplierModal'))?.hide(); loadSuppliers(); } else alert(res.error||'Error'); });
+  });
+
+  const editSupplierForm = document.getElementById('editSupplierForm');
+  if(editSupplierForm) editSupplierForm.addEventListener('submit', e=>{
+    e.preventDefault();
+    const fd = new FormData(editSupplierForm);
+    fetch('api.php?action=edit_supplier',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok){ bootstrap.Modal.getInstance(document.getElementById('editSupplierModal'))?.hide(); loadSuppliers(); } else alert(res.error||'Error'); });
+  });
+
+  // Accounts admin panel
+  function loadAccounts(){
+    api('get_accounts').then(res=>{
+      if(!res.ok) return; 
+      const tbl = document.getElementById('accountsContent'); 
+      if(!tbl) return; 
+      tbl.innerHTML = `<table class="table"><thead><tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Branch</th><th>Actions</th></tr></thead><tbody>${res.accounts.map(a=>`<tr><td>${a.id}</td><td>${escapeHtml(a.username)}</td><td>${escapeHtml(a.email||'')}</td><td>${escapeHtml(a.role)}</td><td>${escapeHtml(a.branch_name||'')}</td><td><button class="btn btn-sm btn-primary edit-account" data-id="${a.id}">Edit</button> <button class="btn btn-sm btn-danger delete-account" data-id="${a.id}">Delete</button></td></tr>`).join('')}</tbody></table>`; 
+      
+      document.querySelectorAll('.edit-account').forEach(btn=> btn.addEventListener('click', ()=>{
+        const id = btn.dataset.id;
+        const user = res.accounts.find(x=>x.id==id);
+        if(!user) return;
+        
+        document.getElementById('editUserId').value = user.id;
+        document.getElementById('editUserName').value = user.username;
+        document.getElementById('editUserEmail').value = user.email || '';
+        document.getElementById('editUserRole').value = user.role;
+        document.getElementById('editUserRole').dispatchEvent(new Event('change')); // Trigger change to show/hide email field
+        setTimeout(()=>{ 
+            const sel=document.getElementById('editUserBranchSelect'); 
+            if(sel) sel.value = user.assigned_branch_id||''; 
+        },100);
+        new bootstrap.Modal(document.getElementById('editUserModal')).show();
+      }));
+
+      document.querySelectorAll('.delete-account').forEach(b=> b.addEventListener('click', ()=>{ if(!confirm('Delete user?')) return; const fd=new FormData(); fd.append('id', b.dataset.id); fetch('api.php?action=delete_user',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ if(res.ok) loadAccounts(); else alert(res.error||'Error'); }); })); 
+    });
+  }
+
+  // register quick modal for admin
+  const registerForm = document.getElementById('registerForm');
+  if(registerForm) registerForm.addEventListener('submit', e=>{ 
+    e.preventDefault(); 
+    const fd = new FormData(registerForm); 
+    fetch('api.php?action=add_user',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{ 
+      if(res.ok){ bootstrap.Modal.getInstance(document.getElementById('registerModal'))?.hide(); loadAccounts(); registerForm.reset(); } 
+      else alert(res.error||'Error'); 
+    }); 
+  });
+
+  // Edit user form handler
+  const editUserForm = document.getElementById('editUserForm');
+  if(editUserForm) editUserForm.addEventListener('submit', e=>{
+    e.preventDefault(); 
+    const fd = new FormData(editUserForm); 
+    fetch('api.php?action=edit_user',{ method:'POST', body: fd }).then(r=>r.json()).then(res=>{
+      if(res.ok){ 
+        bootstrap.Modal.getInstance(document.getElementById('editUserModal'))?.hide(); 
+        loadAccounts(); 
+      } else alert(res.error||'Error'); 
+    }); 
+  });
+
+  // Show/hide email field based on role selection
+  document.getElementById('registerRole')?.addEventListener('change', e => {
+    const emailGroup = document.getElementById('registerEmailGroup');
+    if (e.target.value === 'owner') {
+      emailGroup.classList.remove('d-none');
+    } else {
+      emailGroup.classList.add('d-none');
+    }
+  });
+
+  document.getElementById('editUserRole')?.addEventListener('change', e => {
+    const emailGroup = document.getElementById('editEmailGroup');
+    if (e.target.value === 'owner') {
+      emailGroup.classList.remove('d-none');
+    } else {
+      emailGroup.classList.add('d-none');
+    }
+  });
+
+
+  // Logs - UPDATED: clearer display
+  function loadActionLogs(){ 
+    const downloadBtn = document.getElementById('downloadExcel');
+    if (downloadBtn) downloadBtn.style.display = 'none';
+    const el = document.getElementById('logsContent'); 
+    if(!el) return; 
+    el.innerHTML = '<div class="text-center text-muted">Loading action logs...</div>';
+    api('get_logs',{ params:{ type:'action' }}).then(res=>{
+      if(!res.ok) { el.innerHTML = `<div class="text-danger">Failed to load action logs: ${escapeHtml(res.error||'Unknown error')}</div>`; return; }
+      const rows = res.actions.map(l=>`<tr>
+        <td>${l.id}</td>
+        <td>${escapeHtml(l.action)}</td>
+        <td>${escapeHtml(l.username||'N/A')}</td>
+        <td>${escapeHtml(l.branch_name||'N/A')}</td>
+        <td>${escapeHtml(l.created_at)}</td>
+        <td>${escapeHtml(l.meta||'')}</td>
+      </tr>`).join('');
+      el.innerHTML = `<table class="table"><thead><tr><th>ID</th><th>Action</th><th>User</th><th>Branch</th><th>Time</th><th>Meta</th></tr></thead><tbody>${rows}</tbody></table>`; 
+    }); 
+  }
+
+  function loadSalesLogs(){ 
+    const downloadBtn = document.getElementById('downloadExcel');
+    if (downloadBtn) downloadBtn.style.display = 'block';
+    const el = document.getElementById('logsContent'); 
+    if(!el) return; 
+    el.innerHTML = '<div class="text-center text-muted">Loading sales logs...</div>';
+    api('get_logs',{ params:{ type:'sales' }}).then(res=>{
+      if(!res.ok) { el.innerHTML = `<div class="text-danger">Failed to load sales logs: ${escapeHtml(res.error||'Unknown error')}</div>`; return; }
+const rows = res.sales.map(s=>`<tr>
+        <td>${s.id}</td>
+        <td>${escapeHtml(s.receipt_no)}</td>
+        <td>${escapeHtml(s.products)}</td>
+        <td>₱${formatCurrency(s.total||0)}</td>
+        <td>${escapeHtml(s.payment_mode)}</td>
+        <td>${escapeHtml(s.username||'N/A')}</td>
+        <td>${escapeHtml(s.branch_name||'N/A')}</td>
+        <td>${escapeHtml(s.created_at)}</td>
+      </tr>`).join('');
+      el.innerHTML = `<table class="table"><thead><tr><th>ID</th><th>Receipt No</th><th>Products</th><th>Total</th><th>Payment</th><th>User</th><th>Branch</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table>`; 
+    }); 
+  }
+
+  document.getElementById('showActionLogs')?.addEventListener('click', loadActionLogs);
+  document.getElementById('showSalesLogs')?.addEventListener('click', loadSalesLogs);
+  document.getElementById('downloadExcel')?.addEventListener('click', ()=>{
+    api('export_sales_logs').then(res=>{
+      if(res.ok){
+        const a = document.createElement('a');
+        a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(res.csv);
+        a.download = 'sales_logs.csv';
+        a.click();
+      } else {
+        alert(res.error || 'Could not export sales logs.');
+      }
+    });
+  });
+
+  function renderCart() {
+    console.log('Rendering cart...');
+    const items = CART.slice();
+    if (items.length === 0) {
+        const modalInstance = bootstrap.Modal.getInstance(document.getElementById('checkoutModal'));
+        if (modalInstance) {
+            modalInstance.hide();
+        }
+        return;
+    }
+
+    const elem = document.getElementById('checkoutItems');
+    if (!elem) return;
+
+    elem.innerHTML = '';
+    let total = 0;
+
+    const branch = document.getElementById('posBranchSelect') ? document.getElementById('posBranchSelect').value : '';
+    api('get_products', { params: { q: '', branch_id: branch } }).then(res => {
+        if (!res.ok) {
+            alert(`Failed to load products for checkout: ${res.error}`);
+            return;
+        }
+
+        const productsById = {};
+        (res.products || []).forEach(p => productsById[p.id] = p);
+
+        items.forEach(it => {
+            const p = productsById[it.id];
+            if (!p) return;
+
+            const line = Number(p.price) * it.qty;
+            total += line;
+
+            elem.innerHTML += `
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <div>${escapeHtml(p.name)} (${it.size.toUpperCase()})</div>
+                    <div class="d-flex align-items-center">
+                        <button class="btn btn-sm btn-outline-secondary cart-qty-minus" data-id="${p.id}" data-size="${it.size}">-</button>
+                        <span class="mx-2">${it.qty}</span>
+                        <button class="btn btn-sm btn-outline-secondary cart-qty-plus" data-id="${p.id}" data-size="${it.size}">+</button>
+                        <button class="btn btn-sm btn-danger ms-2 cart-remove" data-id="${p.id}" data-size="${it.size}">x</button>
+                        <div class="ms-3" style="width: 80px; text-align: right;">₱${line.toFixed(2)}</div>
+                    </div>
+                </div>`;
+        });
+
+        document.getElementById('checkoutTotal').textContent = total.toFixed(2);
+
+        elem.querySelectorAll('.cart-qty-plus').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const id = btn.dataset.id;
+                const size = btn.dataset.size;
+                const item = CART.find(x => x.id == id && x.size == size);
+                if (item) {
+                    updateCart(id, size, item.qty + 1);
+                }
+            });
+        });
+
+        elem.querySelectorAll('.cart-qty-minus').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const id = btn.dataset.id;
+                const size = btn.dataset.size;
+                const item = CART.find(x => x.id == id && x.size == size);
+                if (item) {
+                    updateCart(id, size, item.qty - 1);
+                }
+            });
+        });
+
+        elem.querySelectorAll('.cart-remove').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const id = btn.dataset.id;
+                const size = btn.dataset.size;
+                updateCart(id, size, 0);
+            });
+        });
+    });
+  }
+
+  document.getElementById('cartButton')?.addEventListener('click', () => {
+      if (CART.length === 0) {
+          return alert('Cart empty');
+      }
+      renderCart();
+      new bootstrap.Modal(document.getElementById('checkoutModal')).show();
+  });
+
+  // Checkout flow (floating cart) - Now with detailed receipt generation
+  document.getElementById('confirmCheckout')?.addEventListener('click', ()=>{
+    const pm = document.getElementById('paymentMode').value || 'Cash';
+    const branch = document.getElementById('posBranchSelect') ? document.getElementById('posBranchSelect').value : '';
+    const payload = { items: CART, payment_mode: pm, branch_id: branch };
+    
+    // Process the response to build a better receipt
+    api('checkout',{ method:'POST', body: payload }).then(res=>{ // Using the robust API helper
+      if(res.ok){
+        CART = []; updateCartUI();
+        bootstrap.Modal.getInstance(document.getElementById('checkoutModal'))?.hide();
+        
+        // --- START RECEIPT GENERATION ---
+        
+        let receiptText = "";
+        
+        // Header
+        receiptText += "--------------------------------------\n";
+        receiptText += "          MOTIFY RETAIL RECEIPT       \n";
+        receiptText += "--------------------------------------\n";
+        receiptText += `Receipt No: ${res.receipt_no}\n`;
+        // Use the returned timestamp for accuracy
+        receiptText += `Date: ${new Date(res.timestamp).toLocaleString()}\n`; 
+        receiptText += "--------------------------------------\n";
+        receiptText += "ITEM              QTY   PRICE    TOTAL\n";
+        receiptText += "--------------------------------------\n";
+
+        // Items List
+        // Helper function for padded formatting
+        const formatLine = (name, qty, price, total) => {
+            let line = name.padEnd(17).substring(0, 17);
+            line += String(qty).padStart(4);
+            line += ` ${price.toFixed(2).padStart(7)}`;
+            line += ` ${total.toFixed(2).padStart(8)}\n`;
+            return line;
+        };
+
+        (res.items_sold || []).forEach(item => {
+            const lineTotal = item.qty * item.price;
+            receiptText += formatLine(item.name, item.qty, item.price, lineTotal);
+        });
+        
+        // Footer
+        receiptText += "--------------------------------------\n";
+        receiptText += `TOTAL:                  ₱ ${Number(res.total).toFixed(2).padStart(8)}\n`;
+        receiptText += `PAYMENT MODE:           ${escapeHtml(res.payment_mode)}\n`;
+        receiptText += "--------------------------------------\n";
+        receiptText += "THANK YOU FOR YOUR PURCHASE!\n";
+        
+        // --- END RECEIPT GENERATION ---
+        
+        document.getElementById('receiptContent').innerText = receiptText;
+        new bootstrap.Modal(document.getElementById('receiptModal')).show();
+        loadInventory(); loadPOSProducts(); loadBranches();
+      } else alert(res.error||'Error');
+    });
+  });
+  // Print Handler Function
+document.getElementById('printReceiptButton')?.addEventListener('click', () => {
+    const content = document.getElementById('receiptContent').innerText;
+    
+    // Create a temporary iframe or window to contain only the receipt content
+    const printWindow = window.open('', '', 'height=600,width=400');
+    printWindow.document.write('<html><head><title>Receipt</title>');
+    // Simple styling for better print simulation
+    printWindow.document.write('<style>');
+    printWindow.document.write('body { font-family: monospace; font-size: 10px; margin: 10px; }');
+    printWindow.document.write('pre { white-space: pre; margin: 0; padding: 0; }');
+    printWindow.document.write('</style>');
+    printWindow.document.write('</head><body>');
+    printWindow.document.write('<pre>' + content + '</pre>');
+    printWindow.document.write('</body></html>');
+    
+    printWindow.document.close();
+    printWindow.focus();
+    
+    // Delay print call slightly to ensure content is rendered
+    setTimeout(() => {
+        printWindow.print();
+        printWindow.close();
+    }, 250);
+});
+
+  // Init
+  function loadDashboard() {
+    const container = document.getElementById('dashboard-grid');
+    if (!container) return;
+
+    api('get_dashboard_data').then(res => {
+        if (!res.ok) {
+            container.innerHTML = `<div class="text-danger">Failed to load dashboard: ${escapeHtml(res.error)}</div>`;
+            return;
+        }
+
+        // Check role from response and render appropriate dashboard
+        if (res.role === 'staff') {
+            const trendingItemsByCategory = res.trending_items || {};
+            let staffDashboardHtml = '';
+
+            if (Object.keys(trendingItemsByCategory).length > 0) {
+                for (const category in trendingItemsByCategory) {
+                    const items = trendingItemsByCategory[category];
+                    staffDashboardHtml += `
+                        <div class="col-12">
+                            <div class="card">
+                                <div class="card-body">
+                                    <h6 class="card-subtitle mb-2 text-muted">Hot Deals: ${escapeHtml(category)} (Last 30 Days)</h6>
+                                    <div class="row g-3 mt-2">${items.map(item =>
+                                        `<div class="col-xl-2 col-lg-3 col-md-4 col-sm-6 col-6">
+                                            <div class="card h-100 text-center">
+                                                <img src="${escapeHtml(item.photo)}" class="card-img-top" style="height: 120px; object-fit: cover;">
+                                                <div class="card-body p-2">
+                                                    <div class="fw-semibold small">${escapeHtml(item.name)}</div>
+                                                    <span class="badge bg-primary rounded-pill mt-2">${item.qty} sold</span>
+                                                </div>
+                                            </div>
+                                        </div>`
+                                    ).join('')}</div>
+                                </div>
+                            </div>
+                        </div>`;
+                }
+            } else {
+                staffDashboardHtml = '<div class="col-12"><div class="card"><div class="card-body"><p class="text-muted mb-0">No sales data available to determine trending items in your branch.</p></div></div></div>';
+            }
+
+            container.innerHTML = staffDashboardHtml;
+            return; // Stop further execution for staff
+        }
+
+        const salesToday = formatCurrency(res.sales_today);
+        const salesYesterday = formatCurrency(res.sales_yesterday);
+        const salesThisMonth = formatCurrency(res.sales_this_month);
+        const salesLastMonth = formatCurrency(res.sales_last_month);
+        const totalSales = formatCurrency(res.total_sales);
+
+        const compareSales = (current, previous) => {
+            const currentNum = Number(current);
+            const previousNum = Number(previous);
+            let percentageText = '';
+            let arrow = '';
+            let color = 'text-muted';
+            
+            if (previousNum === 0) {
+                if (currentNum > 0) {
+                    arrow = '<i class="fas fa-arrow-up"></i>';
+                    color = 'text-success';
+                }
+            } else {
+                const percentageChange = ((currentNum - previousNum) / previousNum) * 100;
+                if (percentageChange > 0) {
+                    arrow = '<i class="fas fa-arrow-up"></i>';
+                    color = 'text-success';
+                    percentageText = `${percentageChange.toFixed(1)}%`;
+                } else if (percentageChange < 0) {
+                    arrow = '<i class="fas fa-arrow-down"></i>';
+                    color = 'text-danger';
+                    percentageText = `${Math.abs(percentageChange).toFixed(1)}%`;
+                }
+            }
+            return `<span class="${color}">${arrow} ${percentageText}</span>`;
+        };
+
+        const trendTodayYesterday = compareSales(salesToday, salesYesterday);
+        const trendThisMonthLastMonth = compareSales(salesThisMonth, salesLastMonth);
+
+        container.innerHTML = `
+            ${res.low_stocks.length > 0 ? `
+            <div class="col-12 mb-3">
+                <div class="card border-warning">
+                    <div class="card-body">
+                        <h5 class="card-subtitle mb-2 text-danger">⚠️ Low Stocks (5 or less)</h5>
+                        <ul class="list-group list-group-flush" style="max-height: 150px; overflow-y: auto;">${res.low_stocks.map(item => 
+                                `<li class="list-group-item d-flex justify-content-between align-items-center p-1">
+                                    ${escapeHtml(item.name)} (${item.size.toUpperCase()})
+                                    <span class="badge bg-danger rounded-pill">${item.quantity}</span>
+                                </li>`).join('')}</ul>
+                    </div>
+                </div>
+            </div>` : ''}
+            <div class="col-lg-4 col-md-6 mb-3">
+                <div class="card">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">Sales Today</h6>
+                        <h2 class="card-title">₱${salesToday}</h2>
+                        <p class="card-text">
+                            ${trendTodayYesterday} vs yesterday (₱${salesYesterday})
+                        </p>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-4 col-md-6 mb-3">
+                <div class="card">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">Sales This Month</h6>
+                        <h2 class="card-title">₱${salesThisMonth}</h2>
+                        <p class="card-text">
+                            ${trendThisMonthLastMonth} vs last month (₱${salesLastMonth})
+                        </p>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-4 col-md-6 mb-3">
+                <div class="card">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">Total Sales</h6>
+                        <h2 class="card-title">₱${totalSales}</h2>
+                        <p class="card-text text-muted">All-time revenue</p>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-6 mb-3">
+l                <div class="card h-100">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">Sales per Branch</h6>
+                        ${res.sales_per_branch.length > 0 
+                            ? `<ul class="list-group list-group-flush" style="max-height: 250px; overflow-y: auto;">${res.sales_per_branch.map(item => 
+                                `<li class="list-group-item d-flex justify-content-between align-items-center p-1">
+                                    ${escapeHtml(item.name)}
+                                    <span class="fw-bold">₱${Number(item.total_sales).toFixed(2)}</span>
+                                </li>`).join('')}</ul>`
+                            : '<p class="text-muted mb-0">No sales data available per branch.</p>'
+                        }
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-6 mb-3">
+                <div class="card h-100">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">Sales Trend per Branch (Last 30 Days)</h6>
+                        <div style="position: relative; height: 250px;">
+                            <canvas id="branch-trends-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-12 mb-3">
+                <div class="card">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">📉 Least Sold Products (Last 30 Days)</h6>
+                        ${res.least_sold_products && Object.keys(res.least_sold_products).length > 0 
+                            ? `<ul class="list-group list-group-flush" style="max-height: 150px; overflow-y: auto;">${Object.values(res.least_sold_products).map(item => 
+                                `<li class="list-group-item d-flex justify-content-between align-items-center p-1">
+                                    ${escapeHtml(item.name)}
+                                    <span class="badge bg-secondary rounded-pill">${item.qty_sold} sold</span>
+                                </li>`).join('')}</ul>`
+                            : '<p class="text-muted mb-0">No product data available.</p>'
+                        }
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-12 mb-3">
+                <div class="card">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">Sales Trend (Last 30 Days)</h6>
+                        <div style="position: relative; height: 250px;">
+                            <canvas id="trends-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-12 mb-3">
+                <div class="card">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">🔥 Trending Products (Last 30 Days)</h6>
+                        ${res.trending_products && res.trending_products.length > 0 ? `
+                        <div class="row g-3 mt-2">${res.trending_products.map(item =>
+                            `<div class="col-xl-2 col-lg-3 col-md-4 col-sm-6 col-6">
+                                <div class="card h-100 text-center">
+                                    <img src="${escapeHtml(item.photo || 'uploads/no-image.png')}" class="card-img-top" style="height: 120px; object-fit: cover;">
+                                    <div class="card-body p-2">
+                                        <div class="fw-semibold small">${escapeHtml(item.name)}</div>
+                                        <span class="badge bg-primary rounded-pill mt-2">${item.qty_sold} sold</span>
+                                    </div>
+                                </div>
+                            </div>`
+                        ).join('')}</div>
+                        ` : '<p class="text-muted mb-0">No sales data available to determine trending products.</p>'}
+                    </div>
+                </div>
+            </div>
+        `;
+
+        // Sales Trend Chart (Last 30 Days)
+        const salesTimelineData = res.sales_timeline_data || [];
+        if (salesTimelineData.length > 0) {
+            new Chart(document.getElementById('trends-chart'), {
+                type: 'line',
+                data: {
+                    labels: salesTimelineData.map(item => item.date),
+                    datasets: [{
+                        label: 'Daily Sales',
+                        data: salesTimelineData.map(item => item.sales),
+                        borderColor: '#6C5CE7',
+                        backgroundColor: 'rgba(108, 92, 231, 0.2)',
+                        tension: 0.4,
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Sales (₱)'
+                            }
+                        },
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Date'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false,
+                        },
+                        title: {
+                            display: false,
+                        }
+                    }
+                }
+            });
+        } else {
+            document.getElementById('trends-chart').parentElement.innerHTML = '<p class="text-muted mb-0">No sales trend data available for the last 30 days.</p>';
+        }
+
+        // New: Sales Trend per Branch Chart
+        const salesPerBranchTimeline = res.sales_per_branch_timeline || [];
+        const branchChartCanvas = document.getElementById('branch-trends-chart');
+        if (salesPerBranchTimeline.length > 0 && branchChartCanvas) {
+            const branchData = {};
+            const dates = [...new Set(salesPerBranchTimeline.map(item => item.date))].sort();
+
+            salesPerBranchTimeline.forEach(item => {
+                if (!branchData[item.branch_name]) {
+                    branchData[item.branch_name] = {};
+                }
+                branchData[item.branch_name][item.date] = parseFloat(item.sales);
+            });
+
+            const branchColors = ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF', '#FF9F40'];
+            let colorIndex = 0;
+
+            const datasets = Object.keys(branchData).map(branchName => {
+                const color = branchColors[colorIndex % branchColors.length];
+                colorIndex++;
+                return {
+                    label: branchName,
+                    data: dates.map(date => branchData[branchName][date] || 0),
+                    borderColor: color,
+                    backgroundColor: color.replace(')', ', 0.2)').replace('rgb', 'rgba'),
+                    tension: 0.4,
+                    fill: false
+                };
+            });
+
+            new Chart(branchChartCanvas, {
+                type: 'line',
+                data: {
+                    labels: dates,
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Sales (₱)' }
+                        },
+                        x: {
+                            title: { display: true, text: 'Date' }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                        },
+                        title: { display: false }
+                    }
+                }
+            });
+        } else if (branchChartCanvas) {
+            branchChartCanvas.parentElement.innerHTML = '<p class="text-muted mb-0">No sales trend data available for branches.</p>';
+        }
+    });
+  }
+
+  // Set up auto-refresh for the dashboard every 15 seconds
+  // We only set the interval after the first load is complete to avoid race conditions
+  function setupDashboardAutoRefresh() {
+    setInterval(loadDashboard, 15000); // Refresh every 15 seconds
+  }
+
+  // Forgot Password Form Handler
+  const forgotPasswordForm = document.getElementById('forgotPasswordForm');
+  if (forgotPasswordForm) {
+    forgotPasswordForm.addEventListener('submit', e => {
+      e.preventDefault();
+      const email = forgotPasswordForm.querySelector('#email').value;
+      const messageEl = document.getElementById('responseMessage');
+      messageEl.innerHTML = '<div class="alert alert-info">Sending request...</div>';
+
+      const fd = new FormData();
+      fd.append('email', email);
+      api('forgot_password', { method: 'POST', body: fd }).then(res => {
+        if (res.ok) {
+          messageEl.innerHTML = `<div class="alert alert-success">${escapeHtml(res.message)}</div>`;
+          forgotPasswordForm.reset();
+        } else {
+          messageEl.innerHTML = `<div class="alert alert-danger">${escapeHtml(res.error || 'An unknown error occurred.')}</div>`;
+        }
+      });
+    });
+  }
+
+  // Reset Password Form Handler
+  const resetPasswordForm = document.getElementById('resetPasswordForm');
+  if (resetPasswordForm) {
+    resetPasswordForm.addEventListener('submit', e => {
+      e.preventDefault();
+      const password = resetPasswordForm.querySelector('#password').value;
+      const passwordConfirm = resetPasswordForm.querySelector('#password_confirm').value;
+      const messageEl = document.getElementById('responseMessage');
+
+      if (password !== passwordConfirm) {
+        messageEl.innerHTML = '<div class="alert alert-danger">Passwords do not match.</div>';
+        return;
+      }
+
+      messageEl.innerHTML = '<div class="alert alert-info">Resetting password...</div>';
+      const fd = new FormData(resetPasswordForm);
+      api('reset_password', { method: 'POST', body: fd }).then(res => {
+        if (res.ok) {
+          messageEl.innerHTML = `<div class="alert alert-success">${escapeHtml(res.message)} You will be redirected to the login page shortly.</div>`;
+          setTimeout(() => window.location.href = 'login.php', 3000);
+        } else {
+          messageEl.innerHTML = `<div class="alert alert-danger">${escapeHtml(res.error || 'An unknown error occurred.')}</div>`;
+        }
+      });
+    });
+  }
+
+  populateBranchSelects().then(()=>{
+    loadBranches();
+    loadInventory();
+    loadPOSProducts();
+    loadAccounts();
+    loadSuppliers();
+    loadDashboard();
+    setupDashboardAutoRefresh(); // Start auto-refreshing
+    updateCartUI();
+  });
+
+});
